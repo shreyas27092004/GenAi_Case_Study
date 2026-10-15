@@ -21,6 +21,23 @@
 | **"Offline" claims** | Web Speech API in Chrome streams audio to a cloud service; Azure OpenAI is cloud; Chroma no longer uses DuckDB/Parquet (it uses SQLite + HNSW files); Azure needs `AzureOpenAI` client | Claims corrected; real adapter for Azure/OpenAI/Ollama; voice marked as "browser-dependent, not offline". |
 | **Missing for prod** | No evals, tracing, prompt versioning, rate limits, RLS, audit trail, PII handling | Added in sections 4, 8, 9, 10 and 11. |
 
+
+### 0.1 Verification Status (read this before relying on the spec)
+
+A runnable backend implementing this design is in **gympro_backend.zip**. It was tested against a real PostgreSQL 16 instance with row-level security enforced: **44 automated tests pass**, and a live `uvicorn` smoke test (health, login, admin analytics, chat escalation, 401 without a token) passed.
+
+| Verified by tests | Not verified (you must test or build) |
+| :--- | :--- |
+| Every REST endpoint listed in the zip's `app/main.py` | A real LLM (Azure/OpenAI/Ollama): agent behavior was tested with a scripted fake that includes malicious tool calls, not with a live model |
+| Last-spot race (8 concurrent confirms = exactly 1 booking), same-user overlap race, double-confirm replay | The React component in section 6 (not run) |
+| Auth attacks: forged/`alg:none`/expired tokens, deactivated users, role injection at registration | Payment provider: paid plan changes are blocked in `ENV=production` until one is integrated |
+| RLS at database level, RBAC matrix, per-user rate limits, trainer-overlap constraint | Email verification, password reset, token revocation/refresh, MFA |
+| Waitlist FIFO promotion and ineligible-member skipping | Multi-worker rate limiting (current limiter is in-process; use Redis or the gateway) |
+| Nutrition safety (allergens fail closed, minors, pregnancy, calorie floors) | Vector KB / RAG (`search_exercise_kb`, `find_foods` are not implemented; injury protocols are a code table that a physio must review) |
+| Chat safety paths without an LLM (emergency, crisis, eating disorder, cross-user, out of scope) | Load testing, backups, TLS, secrets management, monitoring |
+
+**Deliberate differences from the sketches in sections 5.x** (the zip is the source of truth): the pipeline is a plain async function rather than LangGraph; planner, guards and synthesizer are deterministic (no LLM calls), so safety paths work during an LLM outage; agents run sequentially in dependency order on one DB transaction; HEALTH constraints are enforced inside the tool layer (they cannot be bypassed by what the model asks for); prompts list only the tools that actually exist (an `[AVAILABLE_TOOLS]` block is appended to each prompt at runtime).
+
 ---
 
 ## 1. System Overview & Technology Matrix
@@ -113,7 +130,9 @@ flowchart TB
 
 ---
 
-## 3. Production PostgreSQL Schema v2 (Complete DDL)
+## 3. Production PostgreSQL Schema v2 (Complete DDL, applied and tested on PostgreSQL 16)
+
+Run `CREATE EXTENSION btree_gist; CREATE EXTENSION citext; CREATE EXTENSION pgcrypto;` first. Change the `gympro_app` password before deploying.
 
 ```sql
 -- Extensions
@@ -199,6 +218,7 @@ CREATE TABLE member_profiles (
     dietary_preference VARCHAR(50),
     is_pregnant      BOOLEAN,                        -- NULL = not provided
     medical_clearance BOOLEAN NOT NULL DEFAULT FALSE,-- member confirmed doctor clearance / PAR-Q done
+    activity_level   VARCHAR(20) NOT NULL DEFAULT 'LIGHT' CHECK (activity_level IN ('SEDENTARY','LIGHT','MODERATE','VERY_ACTIVE')),
     daily_step_goal  INT NOT NULL DEFAULT 10000,
     daily_calorie_burn_goal INT NOT NULL DEFAULT 500,
     health_data_consent_at TIMESTAMPTZ,              -- required before Health/Nutrition agents read this row
@@ -403,16 +423,44 @@ ALTER TABLE class_bookings      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE nutrition_plans     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pending_actions     ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY own_rows ON member_profiles   USING (user_id = current_setting('app.user_id')::uuid);
-CREATE POLICY own_rows ON daily_health_logs USING (user_id = current_setting('app.user_id')::uuid);
-CREATE POLICY own_rows ON class_bookings    USING (user_id = current_setting('app.user_id')::uuid
-                                                    OR current_setting('app.role') IN ('ADMIN'));
-CREATE POLICY own_rows ON nutrition_plans   USING (user_id = current_setting('app.user_id')::uuid);
-CREATE POLICY own_rows ON pending_actions   USING (user_id = current_setting('app.user_id')::uuid);
+CREATE POLICY own_rows ON member_profiles   USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
+CREATE POLICY own_rows ON daily_health_logs USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
+CREATE POLICY own_rows ON nutrition_plans   USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
+CREATE POLICY own_rows ON pending_actions   USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid);
 
 -- Least-privilege DB roles
 -- gympro_app       : read/write on operational tables, used by the API
 -- gympro_analytics : SELECT only on analytics views (v_*), statement_timeout = 5s, used by Analytics tools
+
+-- RLS (split policies): members see/modify own rows; SYSTEM (server-internal, set only in code) may act on any
+-- row inside a transaction; ADMIN may only READ bookings (aggregates).
+ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON notifications USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid
+                                              OR current_setting('app.role', true) = 'SYSTEM');
+CREATE POLICY own_rows ON class_bookings
+    USING (user_id = nullif(current_setting('app.user_id', true), '')::uuid OR current_setting('app.role', true) = 'SYSTEM');
+CREATE POLICY admin_read ON class_bookings FOR SELECT USING (current_setting('app.role', true) = 'ADMIN');
+CREATE POLICY system_all ON member_profiles USING (current_setting('app.role', true) = 'SYSTEM');
+CREATE POLICY system_all ON pending_actions USING (current_setting('app.role', true) = 'SYSTEM');
+CREATE POLICY system_all ON nutrition_plans USING (current_setting('app.role', true) = 'SYSTEM');
+CREATE POLICY system_all ON daily_health_logs USING (current_setting('app.role', true) = 'SYSTEM');
+ALTER TABLE class_bookings FORCE ROW LEVEL SECURITY;
+ALTER TABLE member_profiles FORCE ROW LEVEL SECURITY;
+ALTER TABLE daily_health_logs FORCE ROW LEVEL SECURITY;
+ALTER TABLE nutrition_plans FORCE ROW LEVEL SECURITY;
+ALTER TABLE pending_actions FORCE ROW LEVEL SECURITY;
+ALTER TABLE notifications FORCE ROW LEVEL SECURITY;
+
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'gympro_app') THEN
+    CREATE ROLE gympro_app LOGIN PASSWORD 'gympro_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END $$;
+GRANT USAGE ON SCHEMA public TO gympro_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO gympro_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO gympro_app;
+REVOKE UPDATE, DELETE ON audit_log FROM gympro_app;
 ```
 
 ---
@@ -1584,7 +1632,12 @@ export const GymProCoach: React.FC<{ token: string; conversationId: string }> = 
       setMessages((p) => p.map((m) => ({ ...m, actions: m.actions?.filter((a) => a.type !== 'CONFIRM' || a.action_id !== actionId) })));
       push({ sender: 'agent', text: r.ok ? 'Done. It is confirmed.' : `That could not be completed (${r.error}). Want me to find alternatives?` });
     },
-    onError: () => push({ sender: 'agent', text: 'That confirmation expired. Ask me again and I will set it up.' }),
+    onError: (e: any) => {
+      const code = e?.response?.data?.detail?.error ?? e?.response?.data?.error;
+      push({ sender: 'agent', text: code === 'ACTION_EXPIRED' ? 'That confirmation expired. Ask me again and I will set it up.'
+        : code === 'CLASS_FULL' ? 'That class just filled up. Want me to add you to the waitlist?'
+        : `That could not be completed (${code ?? 'unknown error'}). Want me to find alternatives?` });
+    },
   });
 
   const send = (text: string) => {
